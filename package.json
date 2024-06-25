@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "axios-retry": "^4.4.0",
+    "opossum": "^8.1.4"
+  }
+}

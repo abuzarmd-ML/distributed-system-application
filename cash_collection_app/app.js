@@ -1,14 +1,14 @@
-// app.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const axiosRetry = require('axios-retry').default;
 const CircuitBreaker = require('opossum');
 const { getShard } = require('./db');
-const config = require('./config');
+const { insertIntoOutbox } = require('./outboxUtils');
+
 
 const app = express();
-const PORT = process.argv[2] || 3000;
+const PORT = process.argv[2] || 3001;
 
 app.use(bodyParser.json());
 
@@ -41,15 +41,21 @@ app.post('/collect_cash', async (req, res) => {
     }
 
     const connection = getShard(courier_id);
-    const query = 'INSERT INTO transactions (courier_id, amount) VALUES (?, ?)';
 
-    connection.query(query, [courier_id, amount], async (error, results) => {
-        if (error) {
-            return res.status(500).json({ status: 'error', message: error.message });
-        }
-
+    try {
+        const [results] = await connection.query('INSERT INTO transactions (courier_id, amount) VALUES (?, ?)', [courier_id, amount]);
+        
         try {
             const response = await circuitBreaker.fire({
+                amount: amount,
+                currency: 'USD',
+                description: `Transaction for courier ${courier_id}`,
+                userId: courier_id.toString()
+            });
+
+            // Insert into outbox after successful transaction and response from 3rd party
+            await insertIntoOutbox({
+                courier_id: courier_id,
                 amount: amount,
                 currency: 'USD',
                 description: `Transaction for courier ${courier_id}`,
@@ -64,13 +70,26 @@ app.post('/collect_cash', async (req, res) => {
                 }
             });
         } catch (error) {
+            console.error(error);
             res.status(500).json({ status: 'error', message: error.message });
         }
-    });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
 });
 
 app.get('/health', (req, res) => {
     res.sendStatus(200);
+});
+
+app.get('/verify_shards', async (req, res) => {
+    const shardCounts = await Promise.all(pool.map(async (connection, index) => {
+        const [results] = await connection.query('SELECT COUNT(*) as count FROM transactions');
+        return { shard: index, count: results[0].count };
+    }));
+
+    res.json(shardCounts);
 });
 
 app.listen(PORT, () => {

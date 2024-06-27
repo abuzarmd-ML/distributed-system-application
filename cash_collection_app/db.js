@@ -1,20 +1,21 @@
-const mysql = require('mysql');
 const config = require('./config');
+const mysql = require('mysql2/promise');
 
-const shardConnections = config.shards.map(shardConfig => mysql.createConnection(shardConfig));
+const shardPools = config.shards.map(shardConfig => mysql.createPool(shardConfig));
 
 const getShard = (courier_id) => {
     const shardIndex = courier_id % config.shardCount;
-    return shardConnections[shardIndex];
+    return shardPools[shardIndex];
 };
 
-shardConnections.forEach((connection, index) => {
-    connection.connect(err => {
+shardPools.forEach((pool, index) => {
+    pool.getConnection((err, connection) => {
         if (err) {
             console.error(`Database connection to shard ${index} failed: ${err.stack}`);
             return;
         }
         console.log(`Connected to shard ${index}.`);
+        connection.release();
     });
 });
 

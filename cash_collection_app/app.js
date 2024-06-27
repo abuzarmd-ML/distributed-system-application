@@ -1,48 +1,67 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const mysql = require('mysql');
 const axios = require('axios');
+const axiosRetry = require('axios-retry').default;
+const CircuitBreaker = require('opossum');
+const { getShard } = require('./db');
+const { insertIntoOutbox } = require('./outboxUtils');
+
 
 const app = express();
-const PORT = process.argv[2] || 3000;
+const PORT = process.argv[2] || 3001;
 
 app.use(bodyParser.json());
 
-const db = mysql.createConnection({
-    host: 'localhost',
-    user: 'root',
-    password: '',
-    database: 'cash_transaction'
-});
-
-db.connect(err => {
-    if (err) {
-        console.error('Database connection failed: ' + err.stack);
-        return;
+axiosRetry(axios, {
+    retries: 3,
+    retryDelay: (retryCount) => {
+        const delay = Math.pow(2, retryCount) * 100;
+        const jitter = Math.random() * 100;
+        return delay + jitter;
+    },
+    retryCondition: (error) => {
+        return error.response && error.response.status >= 500;
     }
-    console.log('Connected to database.');
 });
 
-// Endpoint to collect cash
-app.post('/collect_cash', (req, res) => {
+const circuitBreakerOptions = {
+    timeout: 3000,
+    errorThresholdPercentage: 50,
+    resetTimeout: 30000
+};
+
+const circuitBreaker = new CircuitBreaker((data) => {
+    return axios.post('http://localhost:8181/v1/wallet/transaction', data);
+}, circuitBreakerOptions);
+
+app.post('/collect_cash', async (req, res) => {
     const { courier_id, amount } = req.body;
     if (!courier_id || !amount) {
         return res.status(400).json({ status: 'error', message: 'Invalid input' });
     }
 
-    const query = 'INSERT INTO transactions (courier_id, amount) VALUES (?, ?)';
-    db.query(query, [courier_id, amount], (error, results) => {
-        if (error) {
-            return res.status(500).json({ status: 'error', message: error.message });
-        }
+    const connection = getShard(courier_id);
+
+    try {
+        const [results] = await connection.query('INSERT INTO transactions (courier_id, amount) VALUES (?, ?)', [courier_id, amount]);
         
-        axios.post('http://localhost:8181/v1/wallet/transaction', {
-            amount: amount,
-            currency: 'USD',
-            description: `Transaction for courier ${courier_id}`,
-            userId: courier_id.toString()
-        })
-        .then(response => {
+        try {
+            const response = await circuitBreaker.fire({
+                amount: amount,
+                currency: 'USD',
+                description: `Transaction for courier ${courier_id}`,
+                userId: courier_id.toString()
+            });
+
+            // Insert into outbox after successful transaction and response from 3rd party
+            await insertIntoOutbox({
+                courier_id: courier_id,
+                amount: amount,
+                currency: 'USD',
+                description: `Transaction for courier ${courier_id}`,
+                userId: courier_id.toString()
+            });
+
             res.json({
                 status: 'success',
                 data: {
@@ -50,15 +69,27 @@ app.post('/collect_cash', (req, res) => {
                     status: response.data.data.status
                 }
             });
-        })
-        .catch(error => {
+        } catch (error) {
+            console.error(error);
             res.status(500).json({ status: 'error', message: error.message });
-        });
-    });
+        }
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
 });
 
 app.get('/health', (req, res) => {
     res.sendStatus(200);
+});
+
+app.get('/verify_shards', async (req, res) => {
+    const shardCounts = await Promise.all(pool.map(async (connection, index) => {
+        const [results] = await connection.query('SELECT COUNT(*) as count FROM transactions');
+        return { shard: index, count: results[0].count };
+    }));
+
+    res.json(shardCounts);
 });
 
 app.listen(PORT, () => {
